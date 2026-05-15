@@ -1,0 +1,21 @@
+Context: We are merging SmbiosChanger into ScootwareCompatModule (EDK2), no symlinked second tree, headless operation, settings from disk.
+
+In this repo, compare SmbiosChanger (UEFI app) and EfiGuardDxe/ScootwareCompatDxe (DXE driver). List differences in module type, entry point, and when each runs. State risks of applying SMBIOS patches from the driver vs a dedicated boot-staged app. Deliver a short recommended integration shape (single binary vs two EFI binaries) with one paragraph of reasoning.
+Inventory
+Enumerate every .c in SmbiosChanger/src, its primary symbols, and which are essential vs UI-only. Output a table: file → functions → keep/split/drop.
+Control flow
+From main.c, extract a pseudocode SmbiosApplySpoofs(void) with no printing, no delays, no keyboard. Note dependencies on gBS, gRT, gST. List edge cases (missing FindEntry, missing SMBIOS protocol).
+Config model
+Replace Config.h with a disk config spec: file path(s), struct or key-value fields mirroring all #define toggles, and load/save order vs NVRAM. Specify failure behavior (fail closed vs use randoms).
+Headless + logging
+Plan how to replace PrintLog, banners, and ConOut checks: use DebugLib, serial ReportStatusCode, or silent. Ensure no WaitForEvent on ConIn in any path.
+Build system
+List exact edits to ScootwareCompatModulePkg.dsc, ScootwareCompatDxe.inf (or a new *.inf): new [Sources], [Protocols], [Guids], HobLib if needed, and any PCD. Note conflicts with DXE_RUNTIME_DRIVER vs UEFI_APPLICATION if you keep two modules.
+Port order
+Propose an implementation order: (1) copy headers and types, (2) smbios + finder, (3) patch without UI, (4) persistence with disk path abstraction, (5) wire entry from chosen boot stage, (6) test matrix on hardware/VM.
+De-duplication
+persistence.c and utils.c both have randomness. List what to merge into one internal API without changing external behavior.
+Security / ops
+List operational steps: where the config file lives on ESP, how a user updates it without a GUI, and what must never be logged (if anything).
+Verification
+read SMBIOS Type 1/2/4 from inside a minimal boot path or from OS after boot, and what proves the patch ran in time.

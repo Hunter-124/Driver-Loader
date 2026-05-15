@@ -1,0 +1,29 @@
+# Build artifacts
+build/
+x64/
+Debug/
+Release/
+
+# Compiled objects
+*.obj
+*.o
+
+# Build logs
+*.tlog
+*.log
+
+# Debug symbols
+*.pdb
+
+# Linker artifacts
+*.ilk
+*.exp
+*.lib
+
+# VS temp files
+*.user
+*.suo
+.vs/
+ipch/
+*.VC.db
+*.VC.opendb
