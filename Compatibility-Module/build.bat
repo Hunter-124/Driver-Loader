@@ -7,36 +7,23 @@ setlocal EnableExtensions EnableDelayedExpansion
 :: at runtime by reading scootware.cfg from the ESP.
 :: ─────────────────────────────────────────────────────────────────────────
 
-:: Script-level headless check (suppress script output)
+:: Script-level headless check (suppress pauses at end / on some errors)
 set "HEADLESS=0"
 if /I "%1"=="--headless" set "HEADLESS=1"
 if "%SCOOTWARE_HEADLESS%"=="1" set "HEADLESS=1"
+rem build_all.bat --no-pause sets SCOOTWARE_NO_PAUSE=1 for CI; treat like headless for pause only.
+if "!SCOOTWARE_NO_PAUSE!"=="1" set "HEADLESS=1"
 cd /d "%~dp0"
 set "ROOT=%CD%"
 
-set "BIN_DIR=C:\Users\nigga\Desktop\Scootware-Master\BIN"
+call "%~dp0..\..\build\lib\env.bat"
+if errorlevel 1 (
+    if "%HEADLESS%"=="0" pause
+    exit /b 2
+)
+
+set "BIN_DIR=%BIN%"
 if not exist "%BIN_DIR%" mkdir "%BIN_DIR%"
-
-:: ── Locate MSBuild via vswhere ─────────────────────────────────────────────
-set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
-if not exist "%VSWHERE%" (
-    echo [-] vswhere.exe not found. Install Visual Studio 2022 or Build Tools.
-    if "%HEADLESS%"=="0" pause
-    exit /b 2
-)
-
-set "MSBUILD_EXE="
-for /f "usebackq delims=" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe`) do (
-    set "MSBUILD_EXE=%%i"
-    goto :msbuild_found
-)
-:msbuild_found
-
-if not defined MSBUILD_EXE (
-    echo [-] MSBuild.exe not found via vswhere.
-    if "%HEADLESS%"=="0" pause
-    exit /b 2
-)
 
 echo [*] MSBuild: %MSBUILD_EXE%
 echo [*] Solution: %ROOT%\ScootwareCompatModule.sln
@@ -44,8 +31,8 @@ echo [*] Output dir: %BIN_DIR%
 echo.
 
 :: ── Check VisualUefi dependency ────────────────────────────────────────────
-:: The .efi projects (ScootwareCompatDxe, Loader) link against
-:: %USERPROFILE%\Desktop\Scootware-Master\VisualUefi\EDK-II libraries.
+:: The .efi projects (ScootwareCompatDxe, Loader) link against VisualUefi\EDK-II
+:: libraries under this module ^(see VISUALUEFI_PATH below^).
 :: EfiDSEFix.exe does NOT need VisualUefi — it builds with standard CRT.
 set "VISUALUEFI_PATH=%ROOT%\VisualUefi"
 if not exist "%VISUALUEFI_PATH%" (
@@ -124,5 +111,3 @@ if not "%BUILD_RESULT%"=="0" (
     echo [!] Build exited with code %BUILD_RESULT%.
     if "%HEADLESS%"=="0" pause
 )
-
-if "%HEADLESS%"=="0" pause
