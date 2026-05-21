@@ -41,7 +41,9 @@ EFIGUARD_CONFIGURATION_DATA gDriverConfig = {
     FALSE                         // WaitForKeyPress
 };
 
-BOOLEAN gHeadless = FALSE;
+// Default ON so anything that runs before EfiGuardInitialize is silent.
+// The init path may flip this OFF after reading scootware.cfg.
+BOOLEAN gHeadless = TRUE;
 
 //
 // Bootmgfw.efi handle
@@ -66,6 +68,14 @@ STATIC EFI_IMAGE_LOAD mOriginalLoadImage = NULL;
 // Original gRT->SetVariable pointer
 //
 STATIC EFI_SET_VARIABLE mOriginalSetVariable = NULL;
+
+//
+// SMBIOS re-apply state (used by ReadyToBoot callback). Declared up here so
+// both the unload path and the init path can reference them.
+//
+STATIC SCOOTWARE_EFI_CONFIG mPendingCfg;
+STATIC BOOLEAN              mPendingCfgValid = FALSE;
+STATIC EFI_EVENT            mReadyToBootEvent = NULL;
 
 #if defined(MDE_CPU_X64)
 #define MM_SYSTEM_RANGE_START                                                  \
@@ -452,6 +462,12 @@ DriverConfigure(IN CONST EFIGUARD_CONFIGURATION_DATA *ConfigurationData) {
 
   gDriverConfig = *ConfigurationData;
 
+  // Keep gHeadless in sync with the caller-supplied WaitForKeyPress so any
+  // later print site honours the updated mode. We intentionally tie the two
+  // together: WaitForKeyPress is a "debug build behaviour" toggle, and the
+  // pretty-print path is what makes the waits meaningful.
+  gHeadless = !gDriverConfig.WaitForKeyPress;
+
   if (!gHeadless) {
     Print(L"Configuration data accepted.\r\n\r\n");
   }
@@ -491,6 +507,12 @@ EfiGuardUnload(IN EFI_HANDLE ImageHandle) {
     gEfiExitBootServicesEvent = NULL;
   }
 
+  // Unregister ReadyToBoot notification (used for SMBIOS re-apply)
+  if (mReadyToBootEvent != NULL) {
+    gBS->CloseEvent(mReadyToBootEvent);
+    mReadyToBootEvent = NULL;
+  }
+
   // Unhook gRT->SetVariable
   if (mOriginalSetVariable != NULL) {
     SetServicePointer(&gRT->Hdr, (VOID **)&gRT->SetVariable,
@@ -509,116 +531,173 @@ EfiGuardUnload(IN EFI_HANDLE ImageHandle) {
 }
 
 //
-// Reads the persistent configuration from scootware.cfg on the ESP.
+// Open the volume the driver was loaded from. The config file lives next to
+// the driver on the ESP, so we resolve the file system through
+// LoadedImage->DeviceHandle rather than scanning all simple-file-system
+// handles (which could pick up the wrong volume on multi-disk systems).
 //
 STATIC
-VOID LoadConfigFromDisk(VOID) {
-  EFI_STATUS Status;
+EFI_STATUS
+OpenLoaderVolume(OUT EFI_FILE_HANDLE *Root) {
+  *Root = NULL;
+
   EFI_LOADED_IMAGE_PROTOCOL *LoadedImage = NULL;
-  EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *Fs = NULL;
-  EFI_FILE_HANDLE Root = NULL;
-  EFI_FILE_HANDLE File = NULL;
-  SCOOTWARE_EFI_CONFIG FileCfg;
-  UINTN ReadSize = sizeof(FileCfg);
-
-  // Find the volume we were loaded from
-  Status = gBS->HandleProtocol(gImageHandle, &gEfiLoadedImageProtocolGuid,
-                               (VOID **)&LoadedImage);
+  EFI_STATUS Status =
+      gBS->HandleProtocol(gImageHandle, &gEfiLoadedImageProtocolGuid,
+                          (VOID **)&LoadedImage);
   if (EFI_ERROR(Status))
-    return;
+    return Status;
 
+  EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *Fs = NULL;
   Status = gBS->HandleProtocol(LoadedImage->DeviceHandle,
                                &gEfiSimpleFileSystemProtocolGuid, (VOID **)&Fs);
   if (EFI_ERROR(Status))
-    return;
+    return Status;
 
-  Status = Fs->OpenVolume(Fs, &Root);
-  if (EFI_ERROR(Status))
-    return;
-
-  Status = Root->Open(Root, &File, SCOOTWARE_CFG_PATH, EFI_FILE_MODE_READ, 0);
-  Root->Close(Root);
-  if (EFI_ERROR(Status))
-    return;
-
-  Status = File->Read(File, &ReadSize, &FileCfg);
-  File->Close(File);
-
-  if (!EFI_ERROR(Status) && ReadSize == sizeof(FileCfg) &&
-      ScootwConfigIsValid(&FileCfg)) {
-    // Map file config to driver config
-    switch (FileCfg.DseBypassMethod) {
-    case 0:
-      gDriverConfig.DseBypassMethod = DSE_DISABLE_NONE;
-      break;
-    case 1:
-      gDriverConfig.DseBypassMethod = DSE_DISABLE_AT_BOOT;
-      break;
-    case 2:
-      gDriverConfig.DseBypassMethod = DSE_DISABLE_SETVARIABLE_HOOK;
-      break;
-    case 3:
-    default:
-      // Auto-pick based on build number (same logic as Loader.efi)
-      if (FileCfg.OsBuildNumber == 0 || FileCfg.OsBuildNumber >= 17134)
-        gDriverConfig.DseBypassMethod = DSE_DISABLE_SETVARIABLE_HOOK;
-      else
-        gDriverConfig.DseBypassMethod = DSE_DISABLE_AT_BOOT;
-      break;
-    }
-
-    gDriverConfig.WaitForKeyPress = (BOOLEAN)(FileCfg.WaitForKeyPress != 0);
-
-    // If WaitForKeyPress is FALSE, we are in HEADLESS mode (no output)
-    gHeadless = !gDriverConfig.WaitForKeyPress;
-  }
+  return Fs->OpenVolume(Fs, Root);
 }
 
 //
-// Writes the persistent configuration to scootware.cfg on the ESP.
+// Read scootware.cfg from the ESP. Returns EFI_SUCCESS only if the file
+// exists, is the expected size, and passes magic/version/checksum validation.
+//
+STATIC
+EFI_STATUS
+ReadConfigFromDisk(OUT SCOOTWARE_EFI_CONFIG *Cfg) {
+  EFI_FILE_HANDLE Root = NULL;
+  EFI_STATUS Status = OpenLoaderVolume(&Root);
+  if (EFI_ERROR(Status))
+    return Status;
+
+  EFI_FILE_HANDLE File = NULL;
+  Status = Root->Open(Root, &File, SCOOTWARE_CFG_PATH, EFI_FILE_MODE_READ, 0);
+  Root->Close(Root);
+  if (EFI_ERROR(Status))
+    return Status;
+
+  UINTN ReadSize = sizeof(*Cfg);
+  Status = File->Read(File, &ReadSize, Cfg);
+  File->Close(File);
+
+  if (EFI_ERROR(Status))
+    return Status;
+  if (ReadSize != sizeof(*Cfg))
+    return EFI_COMPROMISED_DATA;
+  if (!ScootwConfigIsValid(Cfg))
+    return EFI_COMPROMISED_DATA;
+
+  return EFI_SUCCESS;
+}
+
+//
+// Write scootware.cfg to the ESP. Recomputes the checksum before writing.
 //
 STATIC
 EFI_STATUS
 SaveConfigToDisk(IN SCOOTWARE_EFI_CONFIG *Cfg) {
-  EFI_STATUS Status;
-  EFI_LOADED_IMAGE_PROTOCOL *LoadedImage = NULL;
-  EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *Fs = NULL;
-  EFI_FILE_HANDLE Root = NULL;
-  EFI_FILE_HANDLE File = NULL;
-  UINTN WriteSize = sizeof(SCOOTWARE_EFI_CONFIG);
-
-  // Recompute checksum before writing
   Cfg->Checksum = ScootwConfigChecksum(Cfg);
 
-  Status = gBS->HandleProtocol(gImageHandle, &gEfiLoadedImageProtocolGuid,
-                               (VOID **)&LoadedImage);
+  EFI_FILE_HANDLE Root = NULL;
+  EFI_STATUS Status = OpenLoaderVolume(&Root);
   if (EFI_ERROR(Status))
     return Status;
 
-  Status = gBS->HandleProtocol(LoadedImage->DeviceHandle,
-                               &gEfiSimpleFileSystemProtocolGuid, (VOID **)&Fs);
-  if (EFI_ERROR(Status))
-    return Status;
-
-  Status = Fs->OpenVolume(Fs, &Root);
-  if (EFI_ERROR(Status))
-    return Status;
-
-  // Open for write, create if not exists
+  EFI_FILE_HANDLE File = NULL;
   Status = Root->Open(
       Root, &File, SCOOTWARE_CFG_PATH,
       EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0);
-  if (EFI_ERROR(Status)) {
-    Root->Close(Root);
+  Root->Close(Root);
+  if (EFI_ERROR(Status))
     return Status;
-  }
 
+  // Rewrite from the start in case the file already existed at a larger size.
+  File->SetPosition(File, 0);
+
+  UINTN WriteSize = sizeof(*Cfg);
   Status = File->Write(File, &WriteSize, Cfg);
   File->Flush(File);
   File->Close(File);
-  Root->Close(Root);
 
+  if (!EFI_ERROR(Status) && WriteSize != sizeof(*Cfg))
+    Status = EFI_DEVICE_ERROR;
   return Status;
+}
+
+//
+// Decode the on-disk DseBypassMethod into the driver's enum, resolving the
+// "auto" case using OsBuildNumber written by the Windows-side loader.
+//
+STATIC
+EFIGUARD_DSE_BYPASS_TYPE
+ResolveDseBypassMethod(IN CONST SCOOTWARE_EFI_CONFIG *Cfg) {
+  switch (Cfg->DseBypassMethod) {
+  case 0:
+    return DSE_DISABLE_NONE;
+  case 1:
+    return DSE_DISABLE_AT_BOOT;
+  case 2:
+    return DSE_DISABLE_SETVARIABLE_HOOK;
+  case 3:
+  default:
+    // Win10 1803+ / Win11 / unknown → SetVariable hook (well-tested)
+    // Older → AtBoot patch (safer on pre-1803)
+    if (Cfg->OsBuildNumber == 0 || Cfg->OsBuildNumber >= 17134)
+      return DSE_DISABLE_SETVARIABLE_HOOK;
+    return DSE_DISABLE_AT_BOOT;
+  }
+}
+
+//
+// Apply SMBIOS handling from the on-disk config. Capture is one-shot
+// (HwIdCaptured guard), and spoof is one-shot per boot (HwIdApply guard
+// cleared after a successful apply). Returns TRUE if any field of Cfg was
+// mutated and the caller should write it back.
+//
+STATIC
+BOOLEAN
+ProcessSmbiosFromConfig(IN OUT SCOOTWARE_EFI_CONFIG *Cfg) {
+  BOOLEAN Mutated = FALSE;
+
+  if (Cfg->HwIdCaptured == 0 && Cfg->HwIdApply == 0) {
+    // Only capture when no spoof is staged for this boot, so we never trample
+    // the caller-supplied spoof values into our captured baseline.
+    SmbiosCaptureCurrent(Cfg);
+    if (Cfg->HwIdCaptured != 0)
+      Mutated = TRUE;
+  }
+
+  if (Cfg->HwIdApply != 0) {
+    SmbiosApplySpoofs(Cfg);
+    Cfg->HwIdApply = 0;
+    Mutated = TRUE;
+  }
+
+  return Mutated;
+}
+
+//
+// ReadyToBoot callback: re-apply SMBIOS spoofs (some firmwares re-publish the
+// SMBIOS table in BDS, after our early init runs but before the OS loader
+// actually reads it). The on-disk config staged for this boot lives in
+// mPendingCfg/mPendingCfgValid which are declared at file scope above.
+//
+STATIC
+VOID
+EFIAPI
+ReadyToBootSmbiosCallback(IN EFI_EVENT Event, IN VOID *Context) {
+  // Close-once: this event fires at most once per boot, but be defensive.
+  if (mReadyToBootEvent != NULL) {
+    gBS->CloseEvent(mReadyToBootEvent);
+    mReadyToBootEvent = NULL;
+  }
+  if (!mPendingCfgValid)
+    return;
+
+  // Re-apply spoofs against whatever SMBIOS layout the firmware finalized for
+  // ReadyToBoot. We don't reset HwIdApply here because the on-disk file
+  // already had that cleared by the init-time pass; this is purely an
+  // in-memory re-application against potentially-regenerated tables.
+  SmbiosApplySpoofs(&mPendingCfg);
 }
 
 //
@@ -631,89 +710,39 @@ EfiGuardInitialize(IN EFI_HANDLE ImageHandle,
   ASSERT(ImageHandle == gImageHandle);
 
   //
-  // Read configuration from disk early to determine headless state
+  // Defaults: HEADLESS + SetVariable hook. Headless is the safe default — if
+  // there is no config file (e.g. driver launched directly as a UEFI driver
+  // entry, not via Loader.efi), the user wants silence, not a banner-and-wait.
   //
-  EFI_STATUS ConfigStatus;
-  EFI_LOADED_IMAGE_PROTOCOL *LoadedImage = NULL;
-  EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *Fs = NULL;
-  EFI_FILE_HANDLE Root = NULL;
-  EFI_FILE_HANDLE File = NULL;
-  SCOOTWARE_EFI_CONFIG FileCfg;
-  UINTN ReadSize = sizeof(FileCfg);
-  BOOLEAN HaveFile = FALSE;
-
-  // Initialize default config in case file is missing.
-  // Default to HEADLESS (silent) so no output fires if the config file is
-  // absent or corrupt. Non-headless mode must be explicitly enabled by the
-  // Windows-side loader writing WaitForKeyPress = 1 to scootware.cfg.
   gDriverConfig.DseBypassMethod = DSE_DISABLE_SETVARIABLE_HOOK;
   gDriverConfig.WaitForKeyPress = FALSE;
   gHeadless = TRUE;
 
-  ConfigStatus = gBS->HandleProtocol(gImageHandle, &gEfiLoadedImageProtocolGuid,
-                                     (VOID **)&LoadedImage);
-  if (!EFI_ERROR(ConfigStatus)) {
-    ConfigStatus =
-        gBS->HandleProtocol(LoadedImage->DeviceHandle,
-                            &gEfiSimpleFileSystemProtocolGuid, (VOID **)&Fs);
-    if (!EFI_ERROR(ConfigStatus)) {
-      ConfigStatus = Fs->OpenVolume(Fs, &Root);
-      if (!EFI_ERROR(ConfigStatus)) {
-        ConfigStatus =
-            Root->Open(Root, &File, SCOOTWARE_CFG_PATH, EFI_FILE_MODE_READ, 0);
-        Root->Close(Root);
-        if (!EFI_ERROR(ConfigStatus)) {
-          ConfigStatus = File->Read(File, &ReadSize, &FileCfg);
-          File->Close(File);
-          if (!EFI_ERROR(ConfigStatus) && ReadSize == sizeof(FileCfg) &&
-              ScootwConfigIsValid(&FileCfg)) {
-            HaveFile = TRUE;
-          }
-        }
-      }
-    }
-  }
+  //
+  // Read scootware.cfg from the same volume the driver was loaded from.
+  // If anything goes wrong (no file, bad magic/checksum, short read) we just
+  // proceed with the headless defaults and skip SMBIOS work entirely.
+  //
+  SCOOTWARE_EFI_CONFIG FileCfg;
+  BOOLEAN HaveFile = (ReadConfigFromDisk(&FileCfg) == EFI_SUCCESS);
 
   if (HaveFile) {
-    switch (FileCfg.DseBypassMethod) {
-    case 0:
-      gDriverConfig.DseBypassMethod = DSE_DISABLE_NONE;
-      break;
-    case 1:
-      gDriverConfig.DseBypassMethod = DSE_DISABLE_AT_BOOT;
-      break;
-    case 2:
-      gDriverConfig.DseBypassMethod = DSE_DISABLE_SETVARIABLE_HOOK;
-      break;
-    case 3:
-    default:
-      if (FileCfg.OsBuildNumber == 0 || FileCfg.OsBuildNumber >= 17134)
-        gDriverConfig.DseBypassMethod = DSE_DISABLE_SETVARIABLE_HOOK;
-      else
-        gDriverConfig.DseBypassMethod = DSE_DISABLE_AT_BOOT;
-      break;
-    }
+    gDriverConfig.DseBypassMethod = ResolveDseBypassMethod(&FileCfg);
     gDriverConfig.WaitForKeyPress = (BOOLEAN)(FileCfg.WaitForKeyPress != 0);
     gHeadless = !gDriverConfig.WaitForKeyPress;
 
-    // ── SMBIOS / HWID Handling ───────────────────────────────────────────
-    // Capture on first boot, apply if requested. Only call SaveConfigToDisk
-    // once at the end to avoid two sequential FAT32 I/O round-trips.
-    BOOLEAN NeedSave = FALSE;
-    if (FileCfg.HwIdCaptured == 0) {
-      SmbiosCaptureCurrent(&FileCfg);
-      NeedSave = TRUE;
-    }
-
-    if (FileCfg.HwIdApply != 0) {
-      SmbiosApplySpoofs(&FileCfg);
-      FileCfg.HwIdApply = 0;
-      NeedSave = TRUE;
-    }
-
-    if (NeedSave) {
+    // SMBIOS handling: capture-once + apply-on-request. Helper returns TRUE
+    // if Cfg was mutated and needs to be written back; we do exactly one
+    // FAT32 round-trip rather than two.
+    if (ProcessSmbiosFromConfig(&FileCfg)) {
       SaveConfigToDisk(&FileCfg);
     }
+
+    // Stash for the ReadyToBoot re-apply pass. Use CopyMem rather than struct
+    // assignment so the linker doesn't pull in a libc-style memcpy: the EFI
+    // toolchain only provides BaseMemoryLib.
+    CopyMem(&mPendingCfg, &FileCfg, sizeof(mPendingCfg));
+    mPendingCfgValid = TRUE;
   }
 
   // Check if we're not already loaded.
@@ -851,6 +880,25 @@ EfiGuardInitialize(IN EFI_HANDLE ImageHandle,
       gEfiVirtualNotifyEvent = NULL;
       Status = EFI_SUCCESS;
     }
+  }
+
+  //
+  // Register a ReadyToBoot callback to re-apply SMBIOS spoofs late in BDS.
+  // Some firmwares regenerate/relocate the SMBIOS configuration table during
+  // BDS (after our init runs but before the OS loader actually reads it), so
+  // a single apply at driver-init time can be silently undone. Re-applying
+  // at ReadyToBoot is the latest hook that still has gBS available.
+  //
+  // Best-effort only: if no spoof was staged for this boot, or this firmware
+  // doesn't expose the event group, we just skip — the init-time apply is
+  // still in effect.
+  //
+  if (mPendingCfgValid) {
+    EFI_STATUS RtbStatus = gBS->CreateEventEx(
+        EVT_NOTIFY_SIGNAL, TPL_CALLBACK, ReadyToBootSmbiosCallback, NULL,
+        &gEfiEventReadyToBootGuid, &mReadyToBootEvent);
+    if (EFI_ERROR(RtbStatus))
+      mReadyToBootEvent = NULL;  // non-fatal
   }
 
   // Initialize the global kernel patch info struct.

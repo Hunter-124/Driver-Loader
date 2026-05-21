@@ -38,8 +38,13 @@ if not exist "%PCOMP_SLN%" (
     exit /b 1
 )
 
-echo [*] Building PCOMP.exe (incremental)...
-"%MSBUILD_EXE%" "%PCOMP_SLN%" /p:Configuration=Release /p:Platform=x64 /m /v:m /p:PlatformToolset=v143
+echo [*] Cleaning PCOMP build artifacts...
+if exist "%~dp0Utils\PCOMP\output" (
+    rmdir /S /Q "%~dp0Utils\PCOMP\output" >nul 2>&1
+)
+
+echo [*] Building PCOMP.exe (clean build)...
+"%MSBUILD_EXE%" "%PCOMP_SLN%" /p:Configuration=Release /p:Platform=x64 /m /v:m /p:PlatformToolset=v143 /t:Rebuild
 if errorlevel 1 (
     echo [!] PCOMP build failed.
     if not "!SCOOTWARE_NO_PAUSE!"=="1" pause
@@ -153,10 +158,15 @@ if not exist "%SLN_PATH%" (
 )
 
 echo.
-echo [*] Building smap_packed (Release x64)...
+echo [*] Cleaning smap_packed build artifacts...
+if exist "%~dp0Mapper\output" (
+    rmdir /S /Q "%~dp0Mapper\output" >nul 2>&1
+)
+
+echo [*] Building smap_packed (Release x64, clean build)...
 echo.
 
-"%MSBUILD_EXE%" "%SLN_PATH%" /p:Configuration=Release /p:Platform=x64 /m /v:m /p:PlatformToolset=v143
+"%MSBUILD_EXE%" "%SLN_PATH%" /p:Configuration=Release /p:Platform=x64 /m /v:m /p:PlatformToolset=v143 /t:Rebuild
 if errorlevel 1 (
     echo.
     echo [!] Build failed.

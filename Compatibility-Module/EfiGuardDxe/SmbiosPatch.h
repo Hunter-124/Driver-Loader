@@ -1,91 +1,82 @@
 #pragma once
 
 #include <Uefi.h>
+#include <IndustryStandard/SmBios.h>
 #include <Protocol/Smbios.h>
 #include <Protocol/ScootwareConfig.h>
 
-// SMBIOS Entry Point Structure (32-bit)
-#pragma pack(push, 1)
-typedef struct {
-    CHAR8   AnchorString[4];        // "_SM_"
-    UINT8   EntryPointLength;
-    UINT8   MajorVersion;
-    UINT8   MinorVersion;
-    UINT16  MaxStructureSize;
-    UINT8   EntryPointRevision;
-    UINT8   FormattedArea[5];
-    CHAR8   IntermediateAnchorString[5]; // "_DMI_"
-    UINT8   IntermediateChecksum;
-    UINT16  StructureTableLength;
-    UINT32  StructureTableAddress;
-    UINT16  NumberOfStructures;
-    UINT8   BCDRevision;
-} SMBIOS_STRUCTURE_TABLE_CUSTOM;
+//
+// SMBIOS structure type values we care about.
+//
+#ifndef SMBIOS_TYPE_SYSTEM_INFORMATION
+#define SMBIOS_TYPE_SYSTEM_INFORMATION    1
+#endif
+#ifndef SMBIOS_TYPE_BASEBOARD_INFORMATION
+#define SMBIOS_TYPE_BASEBOARD_INFORMATION 2
+#endif
+#ifndef SMBIOS_TYPE_PROCESSOR_INFORMATION
+#define SMBIOS_TYPE_PROCESSOR_INFORMATION 4
+#endif
 
-typedef struct {
-    UINT8   Type;
-    UINT8   Length;
-    UINT16  Handle;
-} SMBIOS_HEADER_CUSTOM;
-
-typedef struct {
-    SMBIOS_HEADER_CUSTOM  Header;
-    UINT8          Manufacturer;
-    UINT8          ProductName;
-    UINT8          Version;
-    UINT8          SerialNumber;
-    UINT8          UUID[16];
-    UINT8          WakeUpType;
-    UINT8          SKUNumber;
-    UINT8          Family;
-} SMBIOS_TYPE1_CUSTOM;
-
-typedef struct {
-    SMBIOS_HEADER_CUSTOM  Header;
-    UINT8          Manufacturer;
-    UINT8          ProductName;
-    UINT8          Version;
-    UINT8          SerialNumber;
-    UINT8          AssetTag;
-    UINT8          FeatureFlags;
-    UINT8          LocationInChassis;
-    UINT16         ChassisHandle;
-    UINT8          BoardType;
-} SMBIOS_TYPE2_CUSTOM;
-
-typedef struct {
-    SMBIOS_HEADER_CUSTOM  Header;
-    UINT8          SocketDesignation;
-    UINT8          ProcessorType;
-    UINT8          ProcessorFamily;
-    UINT8          ProcessorManufacturer;
-    UINT64         ProcessorId;
-    UINT8          ProcessorVersion;
-    UINT8          Voltage;
-    UINT16         ExternalClock;
-    UINT16         MaxSpeed;
-    UINT16         CurrentSpeed;
-    UINT8          Status;
-    UINT8          ProcessorUpgrade;
-    UINT16         L1CacheHandle;
-    UINT16         L2CacheHandle;
-    UINT16         L3CacheHandle;
-    UINT8          SerialNumber;
-    UINT8          AssetTag;
-} SMBIOS_TYPE4_CUSTOM;
-#pragma pack(pop)
-
+//
+// Walker view of an SMBIOS structure record.
+// Pointers index into the live firmware table; no copy is made.
+//
 typedef union {
-    UINT8*                Raw;
-    SMBIOS_HEADER_CUSTOM* Hdr;
-    SMBIOS_TYPE1_CUSTOM*  Type1;
-    SMBIOS_TYPE2_CUSTOM*  Type2;
-    SMBIOS_TYPE4_CUSTOM*  Type4;
-} SMBIOS_STRUCTURE_POINTER_CUSTOM;
+    UINT8*             Raw;
+    SMBIOS_STRUCTURE*  Hdr;
+} SMBIOS_RECORD_POINTER;
 
-// Prototypes
-SMBIOS_STRUCTURE_TABLE_CUSTOM* SmbiosFindEntry(VOID);
+//
+// Unified handle to either a 2.x or 3.x entry point. The two specs use
+// different layouts (and 3.x uses a 64-bit table address) so we keep both
+// representations and a tag for which one was found.
+//
+typedef enum {
+    SmbiosEntryPointNone = 0,
+    SmbiosEntryPoint2X,
+    SmbiosEntryPoint3X
+} SMBIOS_ENTRY_POINT_KIND;
 
-VOID SmbiosCaptureCurrent(IN OUT SCOOTWARE_EFI_CONFIG* Cfg);
+typedef struct {
+    SMBIOS_ENTRY_POINT_KIND       Kind;
+    union {
+        SMBIOS_TABLE_ENTRY_POINT*       V2;  // points into firmware config table
+        SMBIOS_TABLE_3_0_ENTRY_POINT*   V3;
+    } u;
+    UINT8*  TableAddress;   // resolved table start (handles 32-/64-bit)
+    UINT32  TableLength;    // max table length (best effort; may be 0)
+    UINT16  NumStructures;  // 2.x: exact; 3.x: not provided (0)
+} SMBIOS_ENTRY;
 
-VOID SmbiosApplySpoofs(IN CONST SCOOTWARE_EFI_CONFIG* Cfg);
+//
+// Locate the SMBIOS entry point in the EFI configuration table.
+// Prefers SMBIOS 3.0 ("_SM3_") when present, falling back to 2.x.
+// Returns Entry.Kind == SmbiosEntryPointNone if not found.
+//
+VOID
+SmbiosFindEntry(
+    OUT SMBIOS_ENTRY* Entry
+    );
+
+//
+// One-time capture of the live HWID fields (Type 1 UUID + serial, Type 2 serial,
+// Type 4 serial) into Cfg. Sets Cfg->HwIdCaptured = 1.
+// Skips entirely if Cfg->HwIdCaptured is already non-zero, or if HwIdApply is set
+// (so the caller-supplied spoof values are never trampled by capture on the same
+// boot they're about to be applied).
+//
+VOID
+SmbiosCaptureCurrent(
+    IN OUT SCOOTWARE_EFI_CONFIG* Cfg
+    );
+
+//
+// Write the spoof fields from Cfg back into the live SMBIOS table. Strings are
+// edited in place, capped to the existing slot length (no relocation, no
+// pointer fixups). UUID is overwritten in full.
+//
+VOID
+SmbiosApplySpoofs(
+    IN CONST SCOOTWARE_EFI_CONFIG* Cfg
+    );

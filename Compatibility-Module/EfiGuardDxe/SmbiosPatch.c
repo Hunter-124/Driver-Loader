@@ -1,271 +1,334 @@
 #include "ScootwareCompatDxe.h"
 #include "SmbiosPatch.h"
+
 #include <Library/BaseMemoryLib.h>
 #include <Library/BaseLib.h>
-#include <Library/MemoryAllocationLib.h>
+#include <Library/DebugLib.h>
 #include <Guid/Smbios.h>
 
-// SMBIOS 3.0 Table GUID from MdePkg
 extern EFI_GUID gEfiSmbiosTableGuid;
 extern EFI_GUID gEfiSmbios3TableGuid;
 
-/**
- * Find SMBIOS Entry Point Structure
- */
-SMBIOS_STRUCTURE_TABLE_CUSTOM*
+// SMBIOS_TYPE_END_OF_TABLE comes from <IndustryStandard/SmBios.h> (value 0x7F);
+// no local redef needed.
+
+//
+// Maximum bytes we will scan past a record header looking for the double-NULL
+// that terminates the string area. SMBIOS strings are capped at 64 bytes each
+// by the spec; a few KB is a generous safety bound for ~32 strings.
+//
+#define SMBIOS_STRINGS_AREA_MAX     4096
+
+//
+// Maximum number of structures we will walk if NumberOfSmbiosStructures looks
+// implausibly large (e.g. SMBIOS 3.x reports 0). Acts as a backstop in case
+// the End-Of-Table marker is missing.
+//
+#define SMBIOS_WALK_MAX_STRUCTURES  4096
+
+VOID
 SmbiosFindEntry(
-    VOID
-)
+    OUT SMBIOS_ENTRY* Entry
+    )
 {
-    if (gST == NULL || gST->ConfigurationTable == NULL) {
-        return NULL;
-    }
+    ZeroMem(Entry, sizeof(*Entry));
+
+    if (gST == NULL || gST->ConfigurationTable == NULL)
+        return;
+
+    SMBIOS_TABLE_3_0_ENTRY_POINT* V3 = NULL;
+    SMBIOS_TABLE_ENTRY_POINT*     V2 = NULL;
 
     for (UINTN i = 0; i < gST->NumberOfTableEntries; i++) {
-        if (CompareGuid(&gST->ConfigurationTable[i].VendorGuid, &gEfiSmbios3TableGuid)) {
-            return (SMBIOS_STRUCTURE_TABLE_CUSTOM*)gST->ConfigurationTable[i].VendorTable;
-        }
-        if (CompareGuid(&gST->ConfigurationTable[i].VendorGuid, &gEfiSmbiosTableGuid)) {
-            return (SMBIOS_STRUCTURE_TABLE_CUSTOM*)gST->ConfigurationTable[i].VendorTable;
-        }
+        EFI_CONFIGURATION_TABLE* T = &gST->ConfigurationTable[i];
+        if (CompareGuid(&T->VendorGuid, &gEfiSmbios3TableGuid) && V3 == NULL)
+            V3 = (SMBIOS_TABLE_3_0_ENTRY_POINT*)T->VendorTable;
+        else if (CompareGuid(&T->VendorGuid, &gEfiSmbiosTableGuid) && V2 == NULL)
+            V2 = (SMBIOS_TABLE_ENTRY_POINT*)T->VendorTable;
     }
 
-    return NULL;
+    // Prefer SMBIOS 3.x; both may be present on modern systems and they refer
+    // to the same logical table content, but 3.x can address >4GiB.
+    if (V3 != NULL && V3->TableAddress != 0) {
+        Entry->Kind         = SmbiosEntryPoint3X;
+        Entry->u.V3         = V3;
+        Entry->TableAddress = (UINT8*)(UINTN)V3->TableAddress;
+        Entry->TableLength  = V3->TableMaximumSize;
+        Entry->NumStructures= 0;  // not provided in 3.x
+        return;
+    }
+
+    if (V2 != NULL && V2->TableAddress != 0) {
+        Entry->Kind         = SmbiosEntryPoint2X;
+        Entry->u.V2         = V2;
+        Entry->TableAddress = (UINT8*)(UINTN)V2->TableAddress;
+        Entry->TableLength  = (UINT32)V2->TableLength;
+        Entry->NumStructures= V2->NumberOfSmbiosStructures;
+        return;
+    }
 }
 
-/**
- * Calculate total length of SMBIOS structure (including string table)
- */
+//
+// Compute the full byte length of an SMBIOS record: header + formatted area
+// + string set + terminating double-NULL.
+//
 STATIC
-UINT16
-SmbiosTableLength(
-    IN SMBIOS_STRUCTURE_POINTER_CUSTOM Table
-)
+UINT32
+SmbiosRecordLength(
+    IN UINT8* RecordStart
+    )
 {
-    if (Table.Raw == NULL) return 0;
-    
-    // Header length + strings
-    CHAR8* Pointer = (CHAR8*)(Table.Raw + Table.Hdr->Length);
-    
-    // Find double-null terminator (end of string table)
-    // Add safety limit to prevent infinite loops on corrupt tables
-    for (UINTN i = 0; i < 4096; i++) {
-        if (Pointer[i] == 0 && Pointer[i + 1] == 0) {
-            return (UINT16)((UINTN)&Pointer[i] - (UINTN)Table.Raw + 2);
+    SMBIOS_STRUCTURE* Hdr = (SMBIOS_STRUCTURE*)RecordStart;
+    UINT8* Strings = RecordStart + Hdr->Length;
+
+    for (UINTN i = 0; i < SMBIOS_STRINGS_AREA_MAX; ++i) {
+        // End of strings area is double-NULL. If a record has no strings
+        // at all, the formatted area is followed by two NULLs (i.e. i==0).
+        if (Strings[i] == 0 && Strings[i + 1] == 0) {
+            return (UINT32)(Hdr->Length + i + 2);
         }
     }
-    
-    return 0;
+    return 0;  // malformed
 }
 
-/**
- * Find SMBIOS structure by type
- */
+//
+// Walk the SMBIOS table and return a pointer to the Nth structure of the
+// requested type, or NULL if not present.
+//
 STATIC
-SMBIOS_STRUCTURE_POINTER_CUSTOM
-SmbiosFindTableByType(
-    IN SMBIOS_STRUCTURE_TABLE_CUSTOM* Entry,
+UINT8*
+SmbiosFindByType(
+    IN CONST SMBIOS_ENTRY* Entry,
     IN UINT8 Type,
     IN UINTN Index
-)
+    )
 {
-    SMBIOS_STRUCTURE_POINTER_CUSTOM Table;
-    Table.Raw = NULL;
+    if (Entry == NULL || Entry->TableAddress == NULL || Entry->Kind == SmbiosEntryPointNone)
+        return NULL;
 
-    if (Entry == NULL || Entry->StructureTableAddress == 0) {
-        return Table;
-    }
+    UINT8* Cur = Entry->TableAddress;
+    UINT8* End = Entry->TableLength != 0
+                 ? Entry->TableAddress + Entry->TableLength
+                 : (UINT8*)~(UINTN)0;
+    UINTN  FoundCount = 0;
 
-    Table.Raw = (UINT8*)((UINTN)Entry->StructureTableAddress);
-    UINTN FoundCount = 0;
+    // Iteration cap: prefer NumStructures from a 2.x entry; otherwise bound
+    // by SMBIOS_WALK_MAX_STRUCTURES. Either way we also stop on type 127.
+    UINTN MaxIter = Entry->NumStructures != 0
+                    ? Entry->NumStructures
+                    : SMBIOS_WALK_MAX_STRUCTURES;
 
-    for (UINTN i = 0; i < Entry->NumberOfStructures; i++) {
-        if (Table.Hdr->Type == Type) {
-            if (FoundCount == Index) {
-                return Table;
-            }
+    for (UINTN i = 0; i < MaxIter && Cur + sizeof(SMBIOS_STRUCTURE) <= End; ++i) {
+        SMBIOS_STRUCTURE* Hdr = (SMBIOS_STRUCTURE*)Cur;
+
+        if (Hdr->Length < sizeof(SMBIOS_STRUCTURE))
+            return NULL;  // malformed record
+
+        if (Hdr->Type == Type) {
+            if (FoundCount == Index)
+                return Cur;
             FoundCount++;
         }
 
-        if (Table.Hdr->Type == 127) { // End of Table
-            break;
-        }
+        if (Hdr->Type == SMBIOS_TYPE_END_OF_TABLE)
+            return NULL;
 
-        UINT16 Len = SmbiosTableLength(Table);
-        if (Len == 0) break; // Error in table
+        UINT32 Len = SmbiosRecordLength(Cur);
+        if (Len == 0 || Cur + Len > End)
+            return NULL;
 
-        Table.Raw += Len;
+        Cur += Len;
     }
-
-    Table.Raw = NULL;
-    return Table;
+    return NULL;
 }
 
-/**
- * Read SMBIOS string from structure
- */
+//
+// Copy SMBIOS string at StringIndex (1-based) into Output. Output is
+// always NUL-terminated. If StringIndex == 0 (no string) or not found,
+// Output is set to empty.
+//
 STATIC
 VOID
 SmbiosReadString(
-    IN SMBIOS_STRUCTURE_POINTER_CUSTOM Table,
+    IN UINT8* Record,
     IN UINT8 StringIndex,
-    OUT char* Output,
+    OUT CHAR8* Output,
     IN UINTN MaxLength
-)
+    )
 {
-    if (Table.Raw == NULL || StringIndex == 0 || Output == NULL || MaxLength == 0) {
-        if (Output && MaxLength > 0) Output[0] = 0;
+    if (Output == NULL || MaxLength == 0)
         return;
+    Output[0] = '\0';
+
+    if (Record == NULL || StringIndex == 0)
+        return;
+
+    SMBIOS_STRUCTURE* Hdr = (SMBIOS_STRUCTURE*)Record;
+    CHAR8* Strings = (CHAR8*)(Record + Hdr->Length);
+
+    UINT8 Cur = 1;
+    while (Cur < StringIndex) {
+        if (*Strings == 0) return;  // index out of range
+        while (*Strings != 0) Strings++;
+        Strings++;
+        Cur++;
     }
 
-    CHAR8* Pointer = (CHAR8*)(Table.Raw + Table.Hdr->Length);
-    UINT8 CurrentIndex = 1;
+    if (*Strings == 0) return;
 
-    while (CurrentIndex < StringIndex) {
-        while (*Pointer != 0) Pointer++;
-        Pointer++;
-        CurrentIndex++;
-        
-        if (*Pointer == 0) { // End of string table
-            Output[0] = 0;
-            return;
-        }
-    }
-
-    // Copy string
     UINTN i;
-    for (i = 0; i < MaxLength - 1 && Pointer[i] != 0; i++) {
-        Output[i] = Pointer[i];
-    }
-    Output[i] = 0;
+    for (i = 0; i < MaxLength - 1 && Strings[i] != 0; i++)
+        Output[i] = Strings[i];
+    Output[i] = '\0';
 }
 
-/**
- * Edit string directly in SMBIOS table (in-place)
- */
+//
+// Edit an SMBIOS string in place at StringIndex (1-based). The slot length is
+// fixed (we can't relocate the table), so the new string is truncated to fit
+// and padded with spaces if shorter than the original. The original
+// NUL-terminator position is preserved.
+//
 STATIC
 VOID
 SmbiosEditString(
-    IN SMBIOS_STRUCTURE_POINTER_CUSTOM Table,
+    IN UINT8* Record,
     IN UINT8 StringIndex,
-    IN CONST char* Buffer
-)
+    IN CONST CHAR8* Buffer
+    )
 {
-    if (Table.Raw == NULL || StringIndex == 0 || Buffer == NULL) {
+    if (Record == NULL || StringIndex == 0 || Buffer == NULL)
         return;
+
+    SMBIOS_STRUCTURE* Hdr = (SMBIOS_STRUCTURE*)Record;
+    CHAR8* Strings = (CHAR8*)(Record + Hdr->Length);
+
+    UINT8 Cur = 1;
+    while (Cur < StringIndex) {
+        if (*Strings == 0) return;
+        while (*Strings != 0) Strings++;
+        Strings++;
+        Cur++;
     }
+    if (*Strings == 0) return;
 
-    CHAR8* Pointer = (CHAR8*)(Table.Raw + Table.Hdr->Length);
-    UINT8 CurrentIndex = 1;
+    UINTN ExistingLen = AsciiStrLen(Strings);
+    UINTN NewLen      = AsciiStrLen(Buffer);
+    UINTN CopyLen     = (NewLen < ExistingLen) ? NewLen : ExistingLen;
 
-    while (CurrentIndex < StringIndex) {
-        while (*Pointer != 0) Pointer++;
-        Pointer++;
-        CurrentIndex++;
-        
-        if (*Pointer == 0) return;
-    }
+    CopyMem(Strings, Buffer, CopyLen);
+    if (CopyLen < ExistingLen)
+        SetMem(Strings + CopyLen, ExistingLen - CopyLen, ' ');
 
-    UINTN ExistingLen = 0;
-    while (Pointer[ExistingLen] != 0 && ExistingLen < 256) ExistingLen++;
-
-    UINTN NewLen = 0;
-    while (Buffer[NewLen] != 0 && NewLen < 256) NewLen++;
-
-    // In-place edit: we can only copy as many bytes as there is room.
-    // We don't implement table resizing to avoid moving structures and breaking pointers.
-    UINTN CopyLen = (NewLen < ExistingLen) ? NewLen : ExistingLen;
-    
-    CopyMem(Pointer, Buffer, CopyLen);
-    
-    // Pad with spaces if new string is shorter
-    if (NewLen < ExistingLen) {
-        SetMem(Pointer + NewLen, ExistingLen - NewLen, ' ');
-    }
-    
-    // Ensure null terminator remains at the original end
-    Pointer[ExistingLen] = 0;
+    Strings[ExistingLen] = '\0';  // preserve original terminator location
 }
 
-/**
- * Capture current HWID values into Cfg
- */
 VOID
 SmbiosCaptureCurrent(
     IN OUT SCOOTWARE_EFI_CONFIG* Cfg
-)
+    )
 {
-    if (!gHeadless) Print(L"[SMBIOS] Capturing current HWID...\r\n");
+    if (Cfg == NULL) return;
 
-    SMBIOS_STRUCTURE_TABLE_CUSTOM* Entry = SmbiosFindEntry();
-    if (Entry == NULL) {
-        if (!gHeadless) Print(L"[SMBIOS] Failed to find SMBIOS entry point.\r\n");
+    // Defensive: never overwrite spoof fields when the caller has staged a
+    // spoof for this boot (HwIdApply != 0). Capture is also a one-shot:
+    // skip if we've already done it.
+    if (Cfg->HwIdCaptured != 0 || Cfg->HwIdApply != 0)
+        return;
+
+    SMBIOS_ENTRY Entry;
+    SmbiosFindEntry(&Entry);
+    if (Entry.Kind == SmbiosEntryPointNone) {
+        DEBUG((DEBUG_INFO, "[SMBIOS] capture: no entry point\n"));
         return;
     }
 
-    SMBIOS_STRUCTURE_POINTER_CUSTOM Table;
-
-    // Type 1: System Information (UUID, Serial)
-    Table = SmbiosFindTableByType(Entry, 1, 0);
-    if (Table.Raw != NULL) {
-        CopyMem(Cfg->HwIdSpoofUUID, Table.Type1->UUID, 16);
-        SmbiosReadString(Table, Table.Type1->SerialNumber, Cfg->HwIdSpoofSystemSerial, 128);
+    // Type 1: System Information — UUID (offset 0x08) + Serial string
+    UINT8* T1 = SmbiosFindByType(&Entry, SMBIOS_TYPE_SYSTEM_INFORMATION, 0);
+    if (T1 != NULL) {
+        SMBIOS_STRUCTURE* Hdr = (SMBIOS_STRUCTURE*)T1;
+        if (Hdr->Length >= 0x18) {
+            CopyMem(Cfg->HwIdSpoofUUID, T1 + 0x08, 16);
+            UINT8 SerialIdx = T1[0x07];  // Type1.SerialNumber
+            SmbiosReadString(T1, SerialIdx,
+                             Cfg->HwIdSpoofSystemSerial,
+                             sizeof(Cfg->HwIdSpoofSystemSerial));
+        }
     }
 
-    // Type 2: Baseboard Information (Serial)
-    Table = SmbiosFindTableByType(Entry, 2, 0);
-    if (Table.Raw != NULL) {
-        SmbiosReadString(Table, Table.Type2->SerialNumber, Cfg->HwIdSpoofBaseboardSerial, 128);
+    // Type 2: Baseboard — Serial at string index offset 0x07
+    UINT8* T2 = SmbiosFindByType(&Entry, SMBIOS_TYPE_BASEBOARD_INFORMATION, 0);
+    if (T2 != NULL) {
+        SMBIOS_STRUCTURE* Hdr = (SMBIOS_STRUCTURE*)T2;
+        if (Hdr->Length >= 0x08) {
+            UINT8 SerialIdx = T2[0x07];
+            SmbiosReadString(T2, SerialIdx,
+                             Cfg->HwIdSpoofBaseboardSerial,
+                             sizeof(Cfg->HwIdSpoofBaseboardSerial));
+        }
     }
 
-    // Type 4: Processor Information (Serial)
-    Table = SmbiosFindTableByType(Entry, 4, 0);
-    if (Table.Raw != NULL) {
-        SmbiosReadString(Table, Table.Type4->SerialNumber, Cfg->HwIdSpoofProcessorSerial, 128);
+    // Type 4: Processor — Serial at offset 0x20 (string index)
+    UINT8* T4 = SmbiosFindByType(&Entry, SMBIOS_TYPE_PROCESSOR_INFORMATION, 0);
+    if (T4 != NULL) {
+        SMBIOS_STRUCTURE* Hdr = (SMBIOS_STRUCTURE*)T4;
+        if (Hdr->Length >= 0x21) {
+            UINT8 SerialIdx = T4[0x20];
+            SmbiosReadString(T4, SerialIdx,
+                             Cfg->HwIdSpoofProcessorSerial,
+                             sizeof(Cfg->HwIdSpoofProcessorSerial));
+        }
     }
 
     Cfg->HwIdCaptured = 1;
-    if (!gHeadless) Print(L"[SMBIOS] HWID capture complete.\r\n");
+    DEBUG((DEBUG_INFO, "[SMBIOS] captured baseline HWID into config\n"));
 }
 
-/**
- * Apply spoofed values to SMBIOS tables
- */
 VOID
 SmbiosApplySpoofs(
     IN CONST SCOOTWARE_EFI_CONFIG* Cfg
-)
+    )
 {
-    if (!gHeadless) Print(L"[SMBIOS] Applying HWID spoofs...\r\n");
+    if (Cfg == NULL) return;
 
-    SMBIOS_STRUCTURE_TABLE_CUSTOM* Entry = SmbiosFindEntry();
-    if (Entry == NULL) {
-        if (!gHeadless) Print(L"[SMBIOS] Failed to find SMBIOS entry point for spoofing.\r\n");
+    SMBIOS_ENTRY Entry;
+    SmbiosFindEntry(&Entry);
+    if (Entry.Kind == SmbiosEntryPointNone) {
+        DEBUG((DEBUG_INFO, "[SMBIOS] apply: no entry point\n"));
         return;
     }
 
-    SMBIOS_STRUCTURE_POINTER_CUSTOM Table;
+    BOOLEAN WpEnabled, CetEnabled;
+    DisableWriteProtect(&WpEnabled, &CetEnabled);
 
-    // Type 1: System Information
-    Table = SmbiosFindTableByType(Entry, 1, 0);
-    if (Table.Raw != NULL) {
-        // Apply UUID
-        CopyMem(Table.Type1->UUID, Cfg->HwIdSpoofUUID, 16);
-        // Apply Serial
-        SmbiosEditString(Table, Table.Type1->SerialNumber, Cfg->HwIdSpoofSystemSerial);
+    // Type 1: System Information — overwrite UUID and edit Serial string
+    UINT8* T1 = SmbiosFindByType(&Entry, SMBIOS_TYPE_SYSTEM_INFORMATION, 0);
+    if (T1 != NULL) {
+        SMBIOS_STRUCTURE* Hdr = (SMBIOS_STRUCTURE*)T1;
+        if (Hdr->Length >= 0x18) {
+            CopyMem(T1 + 0x08, Cfg->HwIdSpoofUUID, 16);
+            UINT8 SerialIdx = T1[0x07];
+            SmbiosEditString(T1, SerialIdx, Cfg->HwIdSpoofSystemSerial);
+        }
     }
 
-    // Type 2: Baseboard Information
-    Table = SmbiosFindTableByType(Entry, 2, 0);
-    if (Table.Raw != NULL) {
-        SmbiosEditString(Table, Table.Type2->SerialNumber, Cfg->HwIdSpoofBaseboardSerial);
+    UINT8* T2 = SmbiosFindByType(&Entry, SMBIOS_TYPE_BASEBOARD_INFORMATION, 0);
+    if (T2 != NULL) {
+        SMBIOS_STRUCTURE* Hdr = (SMBIOS_STRUCTURE*)T2;
+        if (Hdr->Length >= 0x08) {
+            UINT8 SerialIdx = T2[0x07];
+            SmbiosEditString(T2, SerialIdx, Cfg->HwIdSpoofBaseboardSerial);
+        }
     }
 
-    // Type 4: Processor Information
-    Table = SmbiosFindTableByType(Entry, 4, 0);
-    if (Table.Raw != NULL) {
-        SmbiosEditString(Table, Table.Type4->SerialNumber, Cfg->HwIdSpoofProcessorSerial);
+    UINT8* T4 = SmbiosFindByType(&Entry, SMBIOS_TYPE_PROCESSOR_INFORMATION, 0);
+    if (T4 != NULL) {
+        SMBIOS_STRUCTURE* Hdr = (SMBIOS_STRUCTURE*)T4;
+        if (Hdr->Length >= 0x21) {
+            UINT8 SerialIdx = T4[0x20];
+            SmbiosEditString(T4, SerialIdx, Cfg->HwIdSpoofProcessorSerial);
+        }
     }
 
-    if (!gHeadless) Print(L"[SMBIOS] HWID spoofs applied successfully.\r\n");
+    EnableWriteProtect(WpEnabled, CetEnabled);
+    DEBUG((DEBUG_INFO, "[SMBIOS] spoofs applied\n"));
 }

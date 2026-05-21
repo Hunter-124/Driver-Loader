@@ -53,6 +53,7 @@
   gEfiDevicePathToTextProtocolGuid                 ## CONSUMES
   gEfiDevicePathUtilitiesProtocolGuid              ## CONSUMES
   gEfiLoadedImageProtocolGuid                      ## CONSUMES
+  gEfiSimpleFileSystemProtocolGuid                 ## CONSUMES
   gEfiShellProtocolGuid                            ## SOMETIMES_CONSUMES
   gEfiSimpleTextInProtocolGuid                     ## SOMETIMES_CONSUMES
   gEfiSimpleTextInputExProtocolGuid                ## SOMETIMES_CONSUMES
@@ -61,7 +62,10 @@
   gEfiGlobalVariableGuid                           ## SOMETIMES_PRODUCES
   gEfiEventExitBootServicesGuid                    ## CONSUMES
   gEfiEventVirtualAddressChangeGuid                ## CONSUMES
+  gEfiEventReadyToBootGuid                         ## CONSUMES
   gEfiAcpi20TableGuid                              ## SOMETIMES_CONSUMES
+  gEfiSmbiosTableGuid                              ## SOMETIMES_CONSUMES
+  gEfiSmbios3TableGuid                             ## SOMETIMES_CONSUMES
 
 [Depex]
   gEfiSimpleTextOutProtocolGuid AND

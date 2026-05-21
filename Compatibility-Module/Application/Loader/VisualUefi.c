@@ -1,6 +1,7 @@
 #include <Uefi.h>
 #include <Library/DebugLib.h>
 #include <Protocol/SimpleTextInEx.h>
+#include <Protocol/ScootwareCompat.h>
 
 //
 // This file provides definitions and stubs for VisualUefi build compatibility.
@@ -12,10 +13,15 @@ CONST UINT32 _gUefiDriverRevision     = 0x0210;
 CONST UINT32 _gDxeRevision           = 0x0210;
 CHAR8        *gEfiCallerBaseName     = "Loader";
 
-// Protocol GUIDs used by Loader.c
+// Protocol GUIDs used by Loader.c.
+// gEfiGuardDriverProtocolGuid MUST come from the shared protocol header so the
+// loader and driver agree on the GUID value at runtime. Hand-written GUIDs
+// here were drifting from the canonical EFI_EFIGUARD_DRIVER_PROTOCOL_GUID,
+// which silently broke Loader -> driver Configure() handoff (LocateProtocol
+// returned EFI_NOT_FOUND every boot, so scootware.cfg overrides were dropped).
 EFI_GUID gEfiSimpleTextInputExProtocolGuid = EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL_GUID;
 EFI_GUID gEfiLegacyBiosProtocolGuid        = { 0xdb9c1a96, 0x011b, 0x4164, { 0x82, 0x4b, 0x43, 0x90, 0x11, 0x3e, 0x6e, 0x7a } };
-EFI_GUID gEfiGuardDriverProtocolGuid      = { 0x5b212111, 0x6bd0, 0x4761, { 0x80, 0x87, 0x3f, 0x85, 0x85, 0xba, 0xfa, 0x7b } };
+EFI_GUID gEfiGuardDriverProtocolGuid       = EFI_EFIGUARD_DRIVER_PROTOCOL_GUID;
 
 // Event GUIDs used by UefiLib/Library code
 EFI_GUID gEfiEventLegacyBootGuid          = { 0x27ab5055, 0x111a, 0x4ae7, { 0x93, 0x85, 0x54, 0x33, 0x03, 0xb9, 0x10, 0xce } };

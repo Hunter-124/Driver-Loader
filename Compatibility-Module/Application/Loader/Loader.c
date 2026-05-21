@@ -39,6 +39,16 @@ STATIC CHAR16* mDriverPaths[] = {
 
 STATIC EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *mTextInputEx = NULL;
 
+//
+// Headless mode: default ON. Flipped OFF only if scootware.cfg is present and
+// valid and explicitly opts in via WaitForKeyPress=1. All informational
+// Print() in this loader must go through LdrPrint() so it can be suppressed.
+//
+STATIC BOOLEAN mHeadless = TRUE;
+
+#define LdrPrint(...) \
+	do { if (!mHeadless) { Print(__VA_ARGS__); } } while (FALSE)
+
 VOID
 EFIAPI
 BmRepairAllControllers(
@@ -158,7 +168,7 @@ PromptInput(
 			break;
 	}
 
-	Print(L"%c\r\n\r\n", SelectedChar);
+	LdrPrint(L"%c\r\n\r\n", SelectedChar);
 	return SelectedChar;
 }
 
@@ -333,7 +343,7 @@ OpenConfigFile(
                                             &gEfiLoadedImageProtocolGuid,
                                             (VOID **)&LoadedImage);
     if (EFI_ERROR(Status)) {
-        Print(L"[CFG] HandleProtocol(LoadedImage) failed: %r\r\n", Status);
+        LdrPrint(L"[CFG] HandleProtocol(LoadedImage) failed: %r\r\n", Status);
         return Status;
     }
 
@@ -342,14 +352,14 @@ OpenConfigFile(
                                  &gEfiSimpleFileSystemProtocolGuid,
                                  (VOID **)&Fs);
     if (EFI_ERROR(Status)) {
-        Print(L"[CFG] HandleProtocol(SimpleFileSystem) failed: %r\r\n", Status);
+        LdrPrint(L"[CFG] HandleProtocol(SimpleFileSystem) failed: %r\r\n", Status);
         return Status;
     }
 
     EFI_FILE_HANDLE Root = NULL;
     Status = Fs->OpenVolume(Fs, &Root);
     if (EFI_ERROR(Status)) {
-        Print(L"[CFG] OpenVolume failed: %r\r\n", Status);
+        LdrPrint(L"[CFG] OpenVolume failed: %r\r\n", Status);
         return Status;
     }
 
@@ -363,7 +373,7 @@ OpenConfigFile(
     if (EFI_ERROR(Status)) {
         // EFI_NOT_FOUND is expected on first run before Windows loader wrote the file
         if (Status != EFI_NOT_FOUND)
-            Print(L"[CFG] Open(%S) failed: %r\r\n", SCOOTWARE_CFG_PATH, Status);
+            LdrPrint(L"[CFG] Open(%S) failed: %r\r\n", SCOOTWARE_CFG_PATH, Status);
         return Status;
     }
 
@@ -393,18 +403,18 @@ TryReadConfig(
     File->Close(File);
 
     if (EFI_ERROR(Status)) {
-        Print(L"[CFG] Read failed: %r — using defaults\r\n", Status);
+        LdrPrint(L"[CFG] Read failed: %r — using defaults\r\n", Status);
         return Status;
     }
 
     if (ReadSize != SCOOTWARE_CFG_SIZE) {
-        Print(L"[CFG] File size mismatch (%llu != %llu) — using defaults\r\n",
+        LdrPrint(L"[CFG] File size mismatch (%llu != %llu) — using defaults\r\n",
               (UINT64)ReadSize, (UINT64)SCOOTWARE_CFG_SIZE);
         return EFI_COMPROMISED_DATA;
     }
 
     if (!ScootwConfigIsValid(Cfg)) {
-        Print(L"[CFG] Validation failed (magic/version/checksum) — using defaults\r\n");
+        LdrPrint(L"[CFG] Validation failed (magic/version/checksum) — using defaults\r\n");
         return EFI_COMPROMISED_DATA;
     }
 
@@ -427,14 +437,14 @@ WriteConfig(
     EFI_FILE_HANDLE File = NULL;
     EFI_STATUS Status = OpenConfigFile(TRUE, &File);
     if (EFI_ERROR(Status)) {
-        Print(L"[CFG] Cannot open config for write: %r\r\n", Status);
+        LdrPrint(L"[CFG] Cannot open config for write: %r\r\n", Status);
         return Status;
     }
 
     // Seek to start in case the file already existed
     Status = File->SetPosition(File, 0);
     if (EFI_ERROR(Status)) {
-        Print(L"[CFG] SetPosition failed: %r\r\n", Status);
+        LdrPrint(L"[CFG] SetPosition failed: %r\r\n", Status);
         File->Close(File);
         return Status;
     }
@@ -445,12 +455,12 @@ WriteConfig(
     File->Close(File);
 
     if (EFI_ERROR(Status)) {
-        Print(L"[CFG] Write failed: %r\r\n", Status);
+        LdrPrint(L"[CFG] Write failed: %r\r\n", Status);
         return Status;
     }
 
     if (WriteSize != SCOOTWARE_CFG_SIZE) {
-        Print(L"[CFG] Short write (%llu != %llu)\r\n",
+        LdrPrint(L"[CFG] Short write (%llu != %llu)\r\n",
               (UINT64)WriteSize, (UINT64)SCOOTWARE_CFG_SIZE);
         return EFI_DEVICE_ERROR;
     }
@@ -485,7 +495,7 @@ RemoveSelfFromBootOrder(
                                          &CurSize,
                                          &BootCurrent);
     if (EFI_ERROR(Status)) {
-        Print(L"[CFG] GetVariable(BootCurrent) failed: %r — skipping boot-order removal\r\n",
+        LdrPrint(L"[CFG] GetVariable(BootCurrent) failed: %r — skipping boot-order removal\r\n",
               Status);
         return;
     }
@@ -499,14 +509,14 @@ RemoveSelfFromBootOrder(
                               &OrderSize,
                               NULL);
     if (Status != EFI_BUFFER_TOO_SMALL) {
-        Print(L"[CFG] GetVariable(BootOrder) size probe failed: %r — skipping boot-order removal\r\n",
+        LdrPrint(L"[CFG] GetVariable(BootOrder) size probe failed: %r — skipping boot-order removal\r\n",
               Status);
         return;
     }
 
     UINT16 *BootOrder = AllocatePool(OrderSize);
     if (BootOrder == NULL) {
-        Print(L"[CFG] AllocatePool(%llu) for BootOrder failed\r\n", (UINT64)OrderSize);
+        LdrPrint(L"[CFG] AllocatePool(%llu) for BootOrder failed\r\n", (UINT64)OrderSize);
         return;
     }
 
@@ -516,7 +526,7 @@ RemoveSelfFromBootOrder(
                               &OrderSize,
                               BootOrder);
     if (EFI_ERROR(Status)) {
-        Print(L"[CFG] GetVariable(BootOrder) failed: %r — skipping boot-order removal\r\n",
+        LdrPrint(L"[CFG] GetVariable(BootOrder) failed: %r — skipping boot-order removal\r\n",
               Status);
         FreePool(BootOrder);
         return;
@@ -543,7 +553,7 @@ RemoveSelfFromBootOrder(
         UINTN NewSize = NewCount * sizeof(UINT16);
         if (NewSize == 0) {
             // Deleting the variable entirely would be catastrophic; leave a warning
-            Print(L"[CFG] WARNING: removing ourselves would empty BootOrder — skipping\r\n");
+            LdrPrint(L"[CFG] WARNING: removing ourselves would empty BootOrder — skipping\r\n");
             FreePool(BootOrder);
             return;
         }
@@ -556,11 +566,11 @@ RemoveSelfFromBootOrder(
         FreePool(BootOrder);
 
         if (EFI_ERROR(Status)) {
-            Print(L"[CFG] SetVariable(BootOrder) failed: %r — entry may still appear in firmware UI\r\n",
+            LdrPrint(L"[CFG] SetVariable(BootOrder) failed: %r — entry may still appear in firmware UI\r\n",
                   Status);
             // Don't return; still attempt to delete the Boot#### variable below
         } else {
-            Print(L"[CFG] Removed boot entry %04X from BootOrder\r\n", BootCurrent);
+            LdrPrint(L"[CFG] Removed boot entry %04X from BootOrder\r\n", BootCurrent);
         }
     }
 
@@ -579,9 +589,9 @@ RemoveSelfFromBootOrder(
                               0,    // DataSize   = 0 → delete
                               NULL);
     if (EFI_ERROR(Status) && Status != EFI_NOT_FOUND) {
-        Print(L"[CFG] Failed to delete %s: %r\r\n", BootVarName, Status);
+        LdrPrint(L"[CFG] Failed to delete %s: %r\r\n", BootVarName, Status);
     } else if (Status == EFI_SUCCESS) {
-        Print(L"[CFG] Deleted NVRAM variable %s\r\n", BootVarName);
+        LdrPrint(L"[CFG] Deleted NVRAM variable %s\r\n", BootVarName);
     }
 }
 
@@ -606,7 +616,7 @@ StartEfiGuard(
 	ASSERT((!EFI_ERROR(Status) || Status == EFI_NOT_FOUND));
 	if (Status == EFI_NOT_FOUND)
 	{
-		Print(L"[LOADER] Locating and loading driver file %S...\r\n", EFIGUARD_DRIVER_FILENAME);
+		LdrPrint(L"[LOADER] Locating and loading driver file %S...\r\n", EFIGUARD_DRIVER_FILENAME);
 		for (UINT32 i = 0; i < ARRAY_SIZE(mDriverPaths); ++i)
 		{
 			Status = LocateFile(mDriverPaths[i], &DriverDevicePath);
@@ -615,7 +625,7 @@ StartEfiGuard(
 		}
 		if (EFI_ERROR(Status))
 		{
-			Print(L"[LOADER] Failed to find driver file %S.\r\n", EFIGUARD_DRIVER_FILENAME);
+			LdrPrint(L"[LOADER] Failed to find driver file %S.\r\n", EFIGUARD_DRIVER_FILENAME);
 			goto Exit;
 		}
 
@@ -628,21 +638,21 @@ StartEfiGuard(
 								&DriverHandle);
 		if (EFI_ERROR(Status))
 		{
-			Print(L"[LOADER] LoadImage failed: %llx (%r).\r\n", Status, Status);
+			LdrPrint(L"[LOADER] LoadImage failed: %llx (%r).\r\n", Status, Status);
 			goto Exit;
 		}
 
 		Status = gBS->StartImage(DriverHandle, NULL, NULL);
 		if (EFI_ERROR(Status))
 		{
-			Print(L"[LOADER] StartImage failed: %llx (%r).\r\n", Status, Status);
+			LdrPrint(L"[LOADER] StartImage failed: %llx (%r).\r\n", Status, Status);
 			goto Exit;
 		}
 	}
 	else
 	{
 		ASSERT_EFI_ERROR(Status);
-		Print(L"[LOADER] The driver is already loaded.\r\n");
+		LdrPrint(L"[LOADER] The driver is already loaded.\r\n");
 	}
 
 	Status = gBS->LocateProtocol(&gEfiGuardDriverProtocolGuid,
@@ -654,7 +664,7 @@ StartEfiGuard(
 		// before StartImage returned), so the kernel will still be patched at boot.
 		// We just cannot push scootware.cfg settings to it; it will run with its
 		// compiled-in defaults (DSE_DISABLE_SETVARIABLE_HOOK, no wait-for-key).
-		Print(L"[LOADER] Warning: LocateProtocol failed: %llx (%r) — driver active with defaults.\r\n", Status, Status);
+		LdrPrint(L"[LOADER] Warning: LocateProtocol failed: %llx (%r) — driver active with defaults.\r\n", Status, Status);
 		EfiGuardDriverProtocol = NULL;
 		Status = EFI_SUCCESS;
 	}
@@ -673,15 +683,15 @@ StartEfiGuard(
 		EFI_STATUS CfgStatus = TryReadConfig(&FileCfg);
 		if (CfgStatus == EFI_SUCCESS) {
 			HaveFile = TRUE;
-			Print(L"[CFG] Config loaded: DseMethod=%u WaitKey=%u Flags=0x%X Build=%u\r\n",
+			LdrPrint(L"[CFG] Config loaded: DseMethod=%u WaitKey=%u Flags=0x%X Build=%u\r\n",
 			      FileCfg.DseBypassMethod, (UINT32)FileCfg.WaitForKeyPress,
 			      FileCfg.Flags, FileCfg.OsBuildNumber);
 		} else {
 			// EFI_NOT_FOUND is expected on first run; anything else is anomalous
 			if (CfgStatus != EFI_NOT_FOUND)
-				Print(L"[CFG] Config read error %r — using defaults\r\n", CfgStatus);
+				LdrPrint(L"[CFG] Config read error %r — using defaults\r\n", CfgStatus);
 			else
-				Print(L"[CFG] No config file found — using defaults\r\n");
+				LdrPrint(L"[CFG] No config file found — using defaults\r\n");
 		}
 
 		// Push config to driver only if we could locate its protocol
@@ -712,7 +722,7 @@ StartEfiGuard(
 
 			EFI_STATUS CfgPushStatus = EfiGuardDriverProtocol->Configure(&ConfigData);
 			if (EFI_ERROR(CfgPushStatus)) {
-				Print(L"[LOADER] Driver Configure() returned error %llx (%r).\r\n", CfgPushStatus, CfgPushStatus);
+				LdrPrint(L"[LOADER] Driver Configure() returned error %llx (%r).\r\n", CfgPushStatus, CfgPushStatus);
 				// Non-fatal: driver will use its compiled-in defaults
 			}
 		}
@@ -721,11 +731,11 @@ StartEfiGuard(
 		// First-run housekeeping: clear the FIRST_RUN flag in the config file.
 		//
 		if (HaveFile && (FileCfg.Flags & SCOOTWARE_CFG_FLAG_FIRST_RUN)) {
-			Print(L"[CFG] First-run detected — clearing flag\r\n");
+			LdrPrint(L"[CFG] First-run detected — clearing flag\r\n");
 			FileCfg.Flags &= ~SCOOTWARE_CFG_FLAG_FIRST_RUN;
 			EFI_STATUS WriteStatus = WriteConfig(&FileCfg);
 			if (EFI_ERROR(WriteStatus))
-				Print(L"[CFG] WARNING: could not clear FIRST_RUN flag: %r\r\n", WriteStatus);
+				LdrPrint(L"[CFG] WARNING: could not clear FIRST_RUN flag: %r\r\n", WriteStatus);
 		}
 
 		//
@@ -840,7 +850,7 @@ TryBootOptionsInOrder(
 		// Print what we're booting
 		if (ConvertedPath != NULL)
 		{
-			Print(L"Booting \"%S\"...\r\n    -> %S = %S\r\n",
+			LdrPrint(L"Booting \"%S\"...\r\n    -> %S = %S\r\n",
 				(BootOptions[Index].Description != NULL ? BootOptions[Index].Description : L"<null description>"),
 				IsLegacy ? L"Legacy path" : L"Path", ConvertedPath);
 			FreePool(ConvertedPath);
@@ -876,9 +886,9 @@ TryBootOptionsInOrder(
 		// Handle BBS entries
 		if (IsLegacy)
 		{
-			Print(L"\r\nNOTE: ScootwareCompat does not support legacy (non-UEFI) Windows installations.\r\n"
+			LdrPrint(L"\r\nNOTE: ScootwareCompat does not support legacy (non-UEFI) Windows installations.\r\n"
 				L"The legacy OS will be booted, but ScootwareCompat will not work.\r\nPress any key to acknowledge...\r\n");
-			WaitForKey();
+			if (!mHeadless) WaitForKey();
 
 			EFI_LEGACY_BIOS_PROTOCOL *LegacyBios;
 			Status = gBS->LocateProtocol(&gEfiLegacyBiosProtocolGuid,
@@ -916,7 +926,7 @@ TryBootOptionsInOrder(
 			if (Status == EFI_SECURITY_VIOLATION)
 				gBS->UnloadImage(ImageHandle);
 
-			Print(L"LoadImage error %llx (%r)\r\n", Status, Status);
+			LdrPrint(L"LoadImage error %llx (%r)\r\n", Status, Status);
 			BootOptions[Index].Status = Status;
 			continue;
 		}
@@ -952,7 +962,7 @@ TryBootOptionsInOrder(
 		BootOptions[Index].Status = Status;
 		if (EFI_ERROR(Status))
 		{
-			Print(L"StartImage error %llx (%r)\r\n", Status, Status);
+			LdrPrint(L"StartImage error %llx (%r)\r\n", Status, Status);
 			continue;
 		}
 
@@ -991,9 +1001,26 @@ UefiMain(
 	EfiBootManagerConnectAll();
 
 	//
-	// Set the highest available console mode and clear the screen
+	// Resolve headless mode BEFORE any console interaction. Default is
+	// headless (mHeadless = TRUE at module scope); flip OFF only when
+	// scootware.cfg exists, is valid, and explicitly opts in via
+	// WaitForKeyPress=1. This also gates the SetHighestAvailableTextMode
+	// screen clear below — headless boots should not disturb the firmware
+	// splash or whatever else was on screen.
 	//
-	SetHighestAvailableTextMode();
+	{
+		SCOOTWARE_EFI_CONFIG EarlyCfg;
+		if (TryReadConfig(&EarlyCfg) == EFI_SUCCESS && EarlyCfg.WaitForKeyPress != 0)
+			mHeadless = FALSE;
+	}
+
+	//
+	// Set the highest available console mode and clear the screen — only when
+	// we will actually print. In headless mode we leave the firmware's
+	// console state alone.
+	//
+	if (!mHeadless)
+		SetHighestAvailableTextMode();
 
 	//
 	// Turn off the watchdog timer
@@ -1012,10 +1039,14 @@ UefiMain(
 	CONST EFI_STATUS DriverStatus = StartEfiGuard();
 	if (EFI_ERROR(DriverStatus))
 	{
-		Print(L"\r\nERROR: driver load failed with status %llx (%r).\r\n"
+		LdrPrint(L"\r\nERROR: driver load failed with status %llx (%r).\r\n"
 			L"Press any key to continue, or press ESC to return to the firmware or shell.\r\n",
 			DriverStatus, DriverStatus);
-		if (WaitForKey() == SCAN_ESC)
+		// In headless mode, never block on a key. The hooks may have been
+		// partially installed before the failure, and either way we want the
+		// boot to proceed silently — there is nobody at the console to press
+		// a key.
+		if (!mHeadless && WaitForKey() == SCAN_ESC)
 		{
 			gBS->Exit(gImageHandle, DriverStatus, 0, NULL);
 			return DriverStatus;
@@ -1037,11 +1068,11 @@ UefiMain(
 	if (EFI_ERROR(Status))
 	{
 		CurrentBootOptionIndex = 0xFFFF;
-		Print(L"WARNING: failed to query the current boot option index variable.\r\n"
+		LdrPrint(L"WARNING: failed to query the current boot option index variable.\r\n"
 			L"This could lead to the current device being booted recursively.\r\n"
 			L"If you booted from a removable device, it is recommended that you remove it now.\r\n"
 			L"\r\nPress any key to continue...\r\n");
-		WaitForKey();
+		if (!mHeadless) WaitForKey();
 	}
 
 	// Query all boot options, and try each following the order set in the "BootOrder" variable, except
@@ -1052,7 +1083,7 @@ UefiMain(
 	SCOOTWARE_EFI_CONFIG FileCfg;
 	if (TryReadConfig(&FileCfg) == EFI_SUCCESS && FileCfg.BootmgfwPath[0] != L'\0')
 	{
-		Print(L"[LOADER] Trying configured BootmgfwPath: %s\r\n", (CHAR16*)FileCfg.BootmgfwPath);
+		LdrPrint(L"[LOADER] Trying configured BootmgfwPath: %s\r\n", (CHAR16*)FileCfg.BootmgfwPath);
 		EFI_DEVICE_PATH *CfgPath = NULL;
 		EFI_STATUS CfgStatus = LocateFile((CHAR16*)FileCfg.BootmgfwPath, &CfgPath);
 		if (!EFI_ERROR(CfgStatus) && CfgPath != NULL)
@@ -1069,13 +1100,13 @@ UefiMain(
 				if (!EFI_ERROR(CfgStatus))
 					BootSuccess = TRUE;
 				else
-					Print(L"[LOADER] StartImage failed: %r\r\n", CfgStatus);
+					LdrPrint(L"[LOADER] StartImage failed: %r\r\n", CfgStatus);
 			}
 			else
 			{
 				if (CfgStatus == EFI_SECURITY_VIOLATION)
 					gBS->UnloadImage(CfgHandle);
-				Print(L"[LOADER] LoadImage failed: %r\r\n", CfgStatus);
+				LdrPrint(L"[LOADER] LoadImage failed: %r\r\n", CfgStatus);
 			}
 			FreePool(CfgPath);
 		}
@@ -1122,7 +1153,7 @@ UefiMain(
 			if (EFI_ERROR(FbStatus) || FbPath == NULL)
 				continue;
 
-			Print(L"[LOADER] Trying fallback: %s\r\n", FallbackPaths[fi]);
+			LdrPrint(L"[LOADER] Trying fallback: %s\r\n", FallbackPaths[fi]);
 			EFI_HANDLE FbHandle = NULL;
 			FbStatus = gBS->LoadImage(TRUE, gImageHandle, FbPath, NULL, 0, &FbHandle);
 			FreePool(FbPath);
@@ -1130,7 +1161,7 @@ UefiMain(
 			{
 				if (FbStatus == EFI_SECURITY_VIOLATION)
 					gBS->UnloadImage(FbHandle);
-				Print(L"[LOADER] LoadImage failed: %r\r\n", FbStatus);
+				LdrPrint(L"[LOADER] LoadImage failed: %r\r\n", FbStatus);
 				continue;
 			}
 
@@ -1142,7 +1173,7 @@ UefiMain(
 			if (!EFI_ERROR(FbStatus))
 				BootSuccess = TRUE;
 			else
-				Print(L"[LOADER] StartImage failed: %r\r\n", FbStatus);
+				LdrPrint(L"[LOADER] StartImage failed: %r\r\n", FbStatus);
 		}
 	}
 
@@ -1150,9 +1181,9 @@ UefiMain(
 		return EFI_SUCCESS;
 
 	// We should never reach this unless something is seriously wrong (no boot device / partition table corrupted / catastrophic boot manager failure...)
-	Print(L"Failed to boot anything. This is super bad!\r\n"
+	LdrPrint(L"Failed to boot anything. This is super bad!\r\n"
 		L"Press any key to return to the firmware or shell,\r\nwhich will surely fix this and not make things worse.\r\n");
-	WaitForKey();
+	if (!mHeadless) WaitForKey();
 
 	gBS->Exit(gImageHandle, EFI_SUCCESS, 0, NULL);
 

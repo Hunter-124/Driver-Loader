@@ -154,11 +154,23 @@ int wmain(int argc, wchar_t** argv)
 			RtlInitUnicodeString(&ValName, L"PostBootLaunchTimestamp");
 			NtSetValueKey(hKey, &ValName, 0, REG_QWORD, &SystemTime.QuadPart, sizeof(SystemTime.QuadPart));
 
-			// Bypass method (assume 2 = SetVarHook for now if success via AdjustCiOptions)
-			ULONG BypassMethod = 2; 
-			RtlInitUnicodeString(&ValName, L"EfiMethod"); 
-			NtSetValueKey(hKey, &ValName, 0, REG_DWORD, &BypassMethod, sizeof(BypassMethod));
+			// Per the DCU detection contract there are two distinct DWORDs in
+			// this key:
+			//   EfiMethod       — INSTALL method (1=driver-entry, 2=loader-entry,
+			//                     3=manual), written by the Loader installer.
+			//   PostBootMethod  — DSE bypass that ran post-boot (1=boot-time
+			//                     patch, 2=SetVariable hook), written here.
+			// Writing PostBootMethod here used to clobber EfiMethod, which
+			// corrupted install-method tracking for driver-entry installs (1)
+			// and broke uninstall heuristics that key off the install method.
+			ULONG PostBootMethod = 2;  // AdjustCiOptions success implies SetVarHook backdoor worked
+			RtlInitUnicodeString(&ValName, L"PostBootMethod");
+			NtSetValueKey(hKey, &ValName, 0, REG_DWORD, &PostBootMethod, sizeof(PostBootMethod));
 
+			// Belt-and-braces: the installer should have already set Installed=1,
+			// but if EfiDSEFix ran successfully post-boot we know the bootkit
+			// chain completed at least once. Reasserting is harmless and
+			// covers a corrupted/missing installer write.
 			ULONG Installed = 1;
 			RtlInitUnicodeString(&ValName, L"Installed");
 			NtSetValueKey(hKey, &ValName, 0, REG_DWORD, &Installed, sizeof(Installed));
