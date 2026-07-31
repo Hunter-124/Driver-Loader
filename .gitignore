@@ -21,9 +21,13 @@ Release/
 *.lib
 
 # VS temp files
+.vscode/
+obj/
+bin/
 *.user
 *.suo
 .vs/
+*.ipch/
 ipch/
 *.VC.db
 *.VC.opendb
