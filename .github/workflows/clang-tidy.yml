@@ -23,6 +23,7 @@ jobs:
         shell: pwsh
         run: |
           clang-tidy --version
+          $env:CL = "/I`"$env:GITHUB_WORKSPACE\Compatibility-Module\Include`""
           msbuild Compatibility-Module/Application/EfiDSEFix/src/EfiDSEFix.vcxproj `
             /m /t:ClCompile /p:Configuration=Release /p:Platform=x64 `
             /p:EnableClangTidyCodeAnalysis=true /p:ClangTidyMaxProcesses=0
